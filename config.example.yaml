@@ -1,0 +1,16 @@
+# Example config — copy to config.yaml and customize
+log:
+  level: info
+
+runner:
+  file: .runner
+  capacity: 5
+  timeout: 2h
+  insecure: true
+  fetch_interval: 2s
+  labels:
+    - questhive
+
+kubernetes:
+  namespace: ci-jobs
+  kubeconfig: /etc/rancher/k3s/k3s.yaml
