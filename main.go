@@ -59,8 +59,7 @@ func main() {
 		}
 		setK8sContext(cli, cfg.K8s.Namespace)
 
-		cli, err := client.New(reg.Address, reg.UUID, reg.Token, ver.Version(),
-			client.WithSkipVerify(cfg.Runner.Insecure))
+		cli, err := client.New(reg.Address, cfg.Runner.Insecure, reg.UUID, reg.Token, ver.Version())
 		if err != nil {
 			log.Fatalf("connect to Forgejo: %v", err)
 		}
