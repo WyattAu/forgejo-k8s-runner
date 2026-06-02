@@ -57,7 +57,7 @@ type step struct {
 type workflowDoc struct{ Jobs map[string]workflowJob `yaml:"jobs"` }
 
 var templateRe = regexp.MustCompile(`\$\{\{\s*([^}]+)\s*\}\}`)
-var stepGroupRe = regexp.MustCompile(`##\[group\]Step (\d+):`)
+var stepGroupRe = regexp.MustCompile(`::group::Step (\d+):`)
 var errorRe = regexp.MustCompile(`::error::(Step failed|.+)?`)
 
 func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
@@ -134,9 +134,19 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	defer k8sClient.CoreV1().Pods(k8sNS).Delete(context.Background(), name, metav1.DeleteOptions{})
 
 	startTime := time.Now()
-	k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
-		State: &runnerv1.TaskState{Id: tid, StartedAt: timestamppb.New(startTime)},
-	}))
+	// Send initial UpdateTask with empty step states so Forgejo knows step count
+	initSteps := make([]*runnerv1.StepState, len(job.Steps))
+	for i := range job.Steps {
+		initSteps[i] = &runnerv1.StepState{Id: int64(i)}
+	}
+	if _, err := k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
+		State: &runnerv1.TaskState{
+			Id: tid, StartedAt: timestamppb.New(startTime),
+			Steps: initSteps,
+		},
+	})); err != nil {
+		log.Printf("[k8s] UpdateTask(start) error: %v", err)
+	}
 
 	ok := waitForPod(ctx, name)
 	logs := getPodLogs(ctx, name)
@@ -181,6 +191,8 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 		}))
 		logOffset += len(rows)
 	}
+
+	log.Printf("[k8s] %s boundaries=%d lines=%d", job.Name, len(stepBoundaries), logOffset)
 
 	// Build step states with per-step failure detection from ::error:: annotations
 	now := time.Now()
@@ -249,6 +261,7 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 			LogIndex:  logIdx,
 			LogLength: logLen,
 		}
+		log.Printf("[k8s]   step %d: idx=%d len=%d result=%v start=%v end=%v", i, logIdx, logLen, stepResults[i], stepStart.Format("15:04:05"), stepEnd.Format("15:04:05"))
 	}
 
 	// Overall result: failed if pod failed or any step has ::error::
@@ -266,6 +279,11 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 			Steps: steps,
 		},
 	}))
+	if err != nil {
+		log.Printf("[k8s] UpdateTask(final) error: %v", err)
+	} else {
+		log.Printf("[k8s] %s result=%v steps=%d", job.Name, overallResult, len(steps))
+	}
 }
 
 func parseJob(payload []byte) (*workflowJob, error) {
@@ -278,16 +296,16 @@ func parseJob(payload []byte) (*workflowJob, error) {
 func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Task, secrets map[string]string) string {
 	var b strings.Builder
 	b.WriteString("set +e\n")  // per-step: steps handle their own errors
-	b.WriteString("echo '##[group]Clone repo'\n")
+	b.WriteString("echo '::group::Clone repo'\n")
 	b.WriteString(fmt.Sprintf("mkdir -p %s && git clone --depth 1 %s %s 2>&1\n", wsPath, repoURL, wsPath))
-	b.WriteString("echo '##[endgroup]'\n")
+	b.WriteString("echo '::endgroup::'\n")
 	for k, v := range job.Env {
 		b.WriteString(fmt.Sprintf("export %s=%s\n", k, resolveTemplates(v, task, secrets)))
 	}
 	dwd := job.Defaults.Run.WorkingDirectory
 	for i, s := range job.Steps {
 		nm := s.Name; if nm == "" { nm = s.Uses }
-		b.WriteString(fmt.Sprintf("echo '##[group]Step %d: %s'\n", i+1, nm))
+		b.WriteString(fmt.Sprintf("echo '::group::Step %d: %s'\n", i+1, nm))
 		for k, v := range s.Env {
 			b.WriteString(fmt.Sprintf("export %s=%s\n", k, resolveTemplates(v, task, secrets)))
 		}
@@ -310,7 +328,7 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 				b.WriteString(fmt.Sprintf("echo '[WARN] unhandled: %s'\n", s.Uses))
 			}
 		}
-		b.WriteString("echo '##[endgroup]'\n")
+		b.WriteString("echo '::endgroup::'\n")
 	}
 	b.WriteString("echo ::notice::DONE\n")
 	return b.String()

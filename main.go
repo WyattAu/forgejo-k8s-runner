@@ -8,6 +8,9 @@ import (
 	"syscall"
 	"time"
 
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
+	"connectrpc.com/connect"
+
 	"github.com/WyattAu/forgejo-k8s-runner/app/poll"
 	"github.com/WyattAu/forgejo-k8s-runner/pkg/client"
 	"github.com/WyattAu/forgejo-k8s-runner/pkg/config"
@@ -32,6 +35,18 @@ func main() {
 
 	cli := client.New(reg.Address, cfg.Runner.Insecure, reg.UUID, reg.Token, ver.Version())
 	setK8sContext(cli, cfg.K8s.Namespace)
+
+	// Declare runner capabilities and labels to Forgejo
+	log.Printf("Declaring runner %q with labels %v", reg.Name, cfg.Runner.Labels)
+	dCtx, dCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dCancel()
+	_, err = cli.Declare(dCtx, connect.NewRequest(&runnerv1.DeclareRequest{
+		Version: ver.Version(),
+		Labels:  cfg.Runner.Labels,
+	}))
+	if err != nil {
+		log.Printf("Declare failed (non-fatal): %v", err)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

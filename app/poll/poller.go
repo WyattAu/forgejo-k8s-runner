@@ -1,12 +1,7 @@
-// Copyright 2023 The Gitea Authors. All rights reserved.
-// SPDX-License-Identifier: MIT
-
 package poll
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -19,174 +14,75 @@ import (
 	"github.com/WyattAu/forgejo-k8s-runner/pkg/config"
 )
 
+type TaskHandler func(context.Context, *runnerv1.Task)
+
 type Poller struct {
+	client     client.Client
+	cfg        *config.Config
 	taskHandler TaskHandler
-	client       client.Client
-	capacity     int
+	tasksVersion atomic.Int64
+	pollingCtx context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+}
 
-	cfg          *config.Config
-	tasksVersion atomic.Int64 // tasksVersion used to store the version of the last task fetched from the Gitea.
-
-	pollingCtx      context.Context
-	shutdownPolling context.CancelFunc
-
-	jobsCtx      context.Context
-	shutdownJobs context.CancelFunc
-
-	done chan struct{
-
-
-func New(cfg *config.Config, client client.Client, capacity int, handler TaskHandler) *Poller {
-	pollingCtx, shutdownPolling := context.WithCancel(context.Background())
-
-	jobsCtx, shutdownJobs := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-
+func New(cfg *config.Config, cli client.Client, capacity int) *Poller {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Poller{
-		client: client,
-		runner: runner,
-		cfg:    cfg,
+		client:     cli,
+		cfg:        cfg,
+		pollingCtx: ctx,
+		cancel:     cancel,
+	}
+}
 
-		pollingCtx:      pollingCtx,
-		shutdownPolling: shutdownPolling,
-
-		jobsCtx:      jobsCtx,
-		shutdownJobs: shutdownJobs,
-
-		done: done,
-	
-
+func (p *Poller) SetTaskHandler(h TaskHandler) { p.taskHandler = h }
 
 func (p *Poller) Poll() {
 	limiter := rate.NewLimiter(rate.Every(p.cfg.Runner.FetchInterval), 1)
-	wg := &sync.WaitGroup{
 	for i := 0; i < p.cfg.Runner.Capacity; i++ {
-		wg.Add(1)
-		go p.poll(wg, limiter)
-	
-	wg.Wait()
+		p.wg.Add(1)
+		go p.pollLoop(limiter)
+	}
+	p.wg.Wait()
+}
 
-	// signal that we shutdown
-	close(p.done)
-
-
-func (p *Poller) PollOnce() {
-	limiter := rate.NewLimiter(rate.Every(p.cfg.Runner.FetchInterval), 1)
-
-	p.pollOnce(limiter)
-
-	// signal that we're done
-	close(p.done)
-
+func (p *Poller) pollLoop(limiter *rate.Limiter) {
+	defer p.wg.Done()
+	for {
+		if err := limiter.Wait(p.pollingCtx); err != nil { return }
+		task, ok := p.fetchTask(p.pollingCtx)
+		if !ok || task == nil { continue }
+		func() {
+			defer func() {
+				if r := recover(); r != nil { log.Errorf("panic in task: %v", r) }
+			}()
+			p.taskHandler(p.pollingCtx, task)
+		}()
+	}
+}
 
 func (p *Poller) Shutdown(ctx context.Context) error {
-	p.shutdownPolling()
-
-	select {
-	// graceful shutdown completed succesfully
-	case <-p.done:
-		return nil
-
-	// our timeout for shutting down ran out
-	case <-ctx.Done():
-		// when both the timeout fires and the graceful shutdown
-		// completed succsfully, this branch of the select may
-		// fire. Do a non-blocking check here against the graceful
-		// shutdown status to avoid sending an error if we don't need to.
-		_, ok := <-p.done
-		if !ok {
-			return nil
-		
-
-		// force a shutdown of all running jobs
-		p.shutdownJobs()
-
-		// wait for running jobs to report their status to Gitea
-		_, _ = <-p.done
-
-		return ctx.Err()
-	
-
-
-func (p *Poller) poll(wg *sync.WaitGroup, limiter *rate.Limiter) {
-	defer wg.Done()
-	for {
-		p.pollOnce(limiter)
-
-		select {
-		case <-p.pollingCtx.Done():
-			return
-		default:
-			continue
-		
-	
-
-
-func (p *Poller) pollOnce(limiter *rate.Limiter) {
-	for {
-		if err := limiter.Wait(p.pollingCtx); err != nil {
-			if p.pollingCtx.Err() != nil {
-				log.WithError(err).Debug("limiter wait failed")
-			
-			return
-		
-		task, ok := p.fetchTask(p.pollingCtx)
-		if !ok {
-			continue
-		
-
-		p.runTaskWithRecover(p.jobsCtx, task)
-		return
-	
-
-
-func (p *Poller) runTaskWithRecover(ctx context.Context, task *runnerv1.Task) {
-	defer func() {
-		if r := recover(); r != nil {
-			err := fmt.Errorf("panic: %v", r)
-			log.WithError(err).Error("panic in runTaskWithRecover")
-		
-	}()
-
-	if err := p.taskHandler(ctx, task); err != nil {
-		log.WithError(err).Error("failed to run task")
-	
-
+	p.cancel()
+	p.wg.Wait()
+	return nil
+}
 
 func (p *Poller) fetchTask(ctx context.Context) (*runnerv1.Task, bool) {
 	reqCtx, cancel := context.WithTimeout(ctx, p.cfg.Runner.FetchTimeout)
 	defer cancel()
-
-	// Load the version value that was in the cache when the request was sent.
 	v := p.tasksVersion.Load()
-	resp, err := p.client.FetchTask(reqCtx, connect.NewRequest(&runnerv1.FetchTaskRequest{
-		TasksVersion: v,
-	}))
-	if errors.Is(err, context.DeadlineExceeded) {
-		err = nil
-	
+	resp, err := p.client.FetchTask(reqCtx, connect.NewRequest(&runnerv1.FetchTaskRequest{TasksVersion: v}))
 	if err != nil {
-		log.WithError(err).Error("failed to fetch task")
+		if ctx.Err() == nil { log.WithError(err).Error("failed to fetch task") }
 		return nil, false
-	
+	}
+	task := resp.Msg.GetTask()
+	if task != nil { p.tasksVersion.Store(task.Id) }
+	return task, task != nil
+}
 
-	if resp == nil || resp.Msg == nil {
-		return nil, false
-	
-
-	if resp.Msg.TasksVersion > v {
-		p.tasksVersion.CompareAndSwap(v, resp.Msg.TasksVersion)
-	
-
-	if resp.Msg.Task == nil {
-		return nil, false
-	
-
-	// got a task, set `tasksVersion` to zero to focre query db in next request.
-	p.tasksVersion.CompareAndSwap(resp.Msg.TasksVersion, 0)
-
-	return resp.Msg.Task, true
-
-
-type TaskHandler func(ctx context.Context, task *runnerv1.Task) error
+func (p *Poller) PollOnce() {
+	task, ok := p.fetchTask(context.Background())
+	if ok && task != nil { p.taskHandler(context.Background(), task) }
+}
