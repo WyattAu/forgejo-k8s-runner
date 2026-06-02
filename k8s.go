@@ -110,12 +110,20 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "ws", MountPath: "/workspace"},
 					{Name: "nix", MountPath: "/nix"},
+					{Name: "docker", MountPath: "/var/run/docker.sock"},
+					{Name: "dockercfg", MountPath: "/root/.docker"},
 				},
 			}},
 			Volumes: []corev1.Volume{
 				{Name: "ws", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 				{Name: "nix", VolumeSource: corev1.VolumeSource{
 					HostPath: &corev1.HostPathVolumeSource{Path: "/mnt/pool_HDD_x2/infra/nix"},
+				}},
+				{Name: "docker", VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/var/run/docker.sock"},
+				}},
+				{Name: "dockercfg", VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/root/.docker"},
 				}},
 			},
 		},
