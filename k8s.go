@@ -58,6 +58,7 @@ type workflowDoc struct{ Jobs map[string]workflowJob `yaml:"jobs"` }
 
 var templateRe = regexp.MustCompile(`\$\{\{\s*([^}]+)\s*\}\}`)
 var stepGroupRe = regexp.MustCompile(`##\[group\]Step (\d+):`)
+var errorRe = regexp.MustCompile(`::error::(Step failed|.+)?`)
 
 func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	tid := task.Id
@@ -173,36 +174,85 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 		logOffset += len(rows)
 	}
 
-	// Build step states with precise LogIndex from boundaries
+	// Build step states with per-step failure detection from ::error:: annotations
 	now := time.Now()
-	r := runnerv1.Result_RESULT_SUCCESS
-	if !ok { r = runnerv1.Result_RESULT_FAILURE }
+	duration := now.Sub(startTime)
+
+	// Calculate per-step log ranges for error detection
+	stepStarts := make([]int64, len(job.Steps))
+	stepEnds := make([]int64, len(job.Steps))
+	for i := range job.Steps {
+		stepStarts[i] = 0
+		stepEnds[i] = int64(logOffset)
+		if i > 0 {
+			if s, ok := stepBoundaries[i]; ok { stepStarts[i] = int64(s) }
+		}
+		if i < len(job.Steps)-1 {
+			if e, ok := stepBoundaries[i+1]; ok { stepEnds[i] = int64(e) }
+		}
+	}
+
+	// Detect per-step failure: scan each step's log lines for ::error::
+	stepResults := make([]runnerv1.Result, len(job.Steps))
+	for i := range stepResults {
+		stepResults[i] = runnerv1.Result_RESULT_SUCCESS
+	}
+	for i := range job.Steps {
+		end := stepEnds[i]
+		if end > int64(len(lines)) { end = int64(len(lines)) }
+		for j := stepStarts[i]; j < end; j++ {
+			if errorRe.MatchString(lines[j]) {
+				stepResults[i] = runnerv1.Result_RESULT_FAILURE
+				break
+			}
+		}
+	}
+
 	steps := make([]*runnerv1.StepState, len(job.Steps))
 	for i := range job.Steps {
-		logIdx := int64(0)
-		logLen := int64(1)
-		if start, ok := stepBoundaries[i]; ok {
-			logIdx = int64(start)
-			// Length: from this step to next step (or end)
-			if next, ok2 := stepBoundaries[i+1]; ok2 {
-				logLen = int64(next - start)
-			} else {
-				logLen = int64(logOffset - start)
+		logIdx := stepStarts[i]
+		logLen := stepEnds[i] - stepStarts[i]
+		if logLen < 1 { logLen = 1 }
+		// Truncate last step to exclude trailing ::notice::DONE
+		if i == len(job.Steps)-1 {
+			for j := logIdx + logLen - 1; j >= logIdx; j-- {
+				if strings.Contains(lines[j], "::notice::DONE") {
+					logLen = j - logIdx
+					if logLen < 1 { logLen = 1 }
+					break
+				}
 			}
-			if logLen < 1 { logLen = 1 }
+		}
+		// Estimate per-step timing: proportional to log position
+		stepStart := startTime
+		stepEnd := now
+		if logOffset > 0 {
+			fraction := float64(logIdx) / float64(logOffset)
+			stepStart = startTime.Add(time.Duration(fraction * float64(duration)))
+			if i < len(job.Steps)-1 {
+				nextFraction := float64(logIdx+logLen) / float64(logOffset)
+				stepEnd = startTime.Add(time.Duration(nextFraction * float64(duration)))
+			}
 		}
 		steps[i] = &runnerv1.StepState{
-			Id: int64(i), Result: r,
-			StartedAt: timestamppb.New(startTime),
-			StoppedAt: timestamppb.New(now),
+			Id: int64(i), Result: stepResults[i],
+			StartedAt: timestamppb.New(stepStart),
+			StoppedAt: timestamppb.New(stepEnd),
 			LogIndex:  logIdx,
 			LogLength: logLen,
 		}
 	}
 
+	// Overall result: failed if pod failed or any step has ::error::
+	overallResult := runnerv1.Result_RESULT_SUCCESS
+	if !ok { overallResult = runnerv1.Result_RESULT_FAILURE }
+	for _, sr := range stepResults {
+		if sr == runnerv1.Result_RESULT_FAILURE { overallResult = runnerv1.Result_RESULT_FAILURE }
+	}
+
 	k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
 		State: &runnerv1.TaskState{
-			Id: tid, Result: r,
+			Id: tid, Result: overallResult,
 			StartedAt: timestamppb.New(startTime),
 			StoppedAt: timestamppb.New(now),
 			Steps: steps,
@@ -219,7 +269,7 @@ func parseJob(payload []byte) (*workflowJob, error) {
 
 func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Task, secrets map[string]string) string {
 	var b strings.Builder
-	b.WriteString("set -e\n")
+	b.WriteString("set +e\n")  // per-step: steps handle their own errors
 	b.WriteString("echo '##[group]Clone repo'\n")
 	b.WriteString(fmt.Sprintf("mkdir -p %s && git clone --depth 1 %s %s 2>&1\n", wsPath, repoURL, wsPath))
 	b.WriteString("echo '##[endgroup]'\n")
@@ -238,7 +288,8 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 		b.WriteString(fmt.Sprintf("cd %s\n", tgt))
 		if s.Run != "" {
 			sh := s.Shell; if sh == "" { sh = "bash" }
-			b.WriteString(resolveTemplates(s.Run, task, secrets) + "\n")
+			// Run with set -e, capture exit code, but don't kill the script
+			b.WriteString("(\nset -e\n" + resolveTemplates(s.Run, task, secrets) + "\n) || echo '::error::Step failed'\n")
 		} else if s.Uses != "" {
 			if strings.Contains(s.Uses, "actions/checkout") {
 				b.WriteString("echo checkout:done\n")
