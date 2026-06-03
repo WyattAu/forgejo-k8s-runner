@@ -302,16 +302,16 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 	b.WriteString(fmt.Sprintf("mkdir -p %s && git clone --depth 1 %s %s 2>&1\n", wsPath, repoURL, wsPath))
 	b.WriteString("echo '::endgroup::'\n")
 	for k, v := range job.Env {
-		resolved := resolveTemplates(v, task, secrets)
-		b.WriteString(fmt.Sprintf("export %s='%s'\n", k, strings.ReplaceAll(resolved, "'", "'\\''")))
-		if strings.HasPrefix(v, "${{") { log.Printf("[k8s] env %s: %s -> %s", k, v, resolved) }
+	resolved := resolveTemplates(v, task, secrets, job.Env)
+	b.WriteString(fmt.Sprintf("export %s='%s'\n", k, strings.ReplaceAll(resolved, "'", "'\\''")))
+	if strings.HasPrefix(v, "${{") { log.Printf("[k8s] env %s: %s -> %s", k, v, resolved) }
 	}
 	dwd := job.Defaults.Run.WorkingDirectory
 	for i, s := range job.Steps {
 		nm := s.Name; if nm == "" { nm = s.Uses }
 		b.WriteString(fmt.Sprintf("echo '::group::Step %d: %s'\n", i+1, nm))
 		for k, v := range s.Env {
-			resolved := resolveTemplates(v, task, secrets)
+			resolved := resolveTemplates(v, task, secrets, job.Env)
 			// Simple export with single quotes (values are validated to have no quotes)
 			b.WriteString(fmt.Sprintf("export %s='%s'\n", k, strings.ReplaceAll(resolved, "'", "'\\''")))
 			if strings.HasPrefix(v, "${{") { log.Printf("[k8s] step-env %s -> %s", k, resolved) }
@@ -322,7 +322,7 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 		if s.Run != "" {
 			sh := s.Shell; if sh == "" { sh = "bash" }
 			// Run with set -e, capture exit code, but don't kill the script
-			b.WriteString("(\nset -e\n" + resolveTemplates(s.Run, task, secrets) + "\n) || echo '::error::Step failed'\n")
+			b.WriteString("(\nset -e\n" + resolveTemplates(s.Run, task, secrets, job.Env) + "\n) || echo '::error::Step failed'\n")
 		} else if s.Uses != "" {
 			if strings.Contains(s.Uses, "actions/checkout") {
 				b.WriteString("echo checkout:done\n")
@@ -341,7 +341,7 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 	return b.String()
 }
 
-func resolveTemplates(s string, task *runnerv1.Task, secrets map[string]string) string {
+func resolveTemplates(s string, task *runnerv1.Task, secrets map[string]string, workflowEnv map[string]string) string {
 	return templateRe.ReplaceAllStringFunc(s, func(match string) string {
 		inner := templateRe.FindStringSubmatch(match)[1]
 		inner = strings.TrimSpace(inner)
@@ -355,7 +355,13 @@ func resolveTemplates(s string, task *runnerv1.Task, secrets map[string]string) 
 			return match
 		}
 		if strings.HasPrefix(inner, "env.") {
-			if v, ok := task.Context.Fields[strings.TrimPrefix(inner, "env.")]; ok {
+			k := strings.TrimPrefix(inner, "env.")
+			if v, ok := workflowEnv[k]; ok { return v }
+			if v, ok := task.Context.Fields[k]; ok { return v.GetStringValue() }
+			return match
+		}
+		if strings.HasPrefix(inner, "github.") {
+			if v, ok := task.Context.Fields[strings.TrimPrefix(inner, "github.")]; ok {
 				return v.GetStringValue()
 			}
 			return match
