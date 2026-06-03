@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/url"
@@ -312,16 +313,10 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 		b.WriteString(fmt.Sprintf("echo '::group::Step %d: %s'\n", i+1, nm))
 		for k, v := range s.Env {
 			resolved := resolveTemplates(v, task, secrets)
-			// Use heredoc to safely pass any value (avoids shell escaping pitfalls)
-			b.WriteString(fmt.Sprintf("export %s=\"$(cat <<'ENVEOF'\n%s\nENVEOF\n)\"\n", k, resolved))
-			if strings.HasPrefix(v, "${{") { log.Printf("[k8s] step-env %s: -> %s", k, resolved) }
-		}
-		// Debug: verify env vars are set and have content
-		if len(s.Env) > 0 {
-			b.WriteString("echo '[DEBUG-ENV]'\n")
-			for k := range s.Env {
-				b.WriteString(fmt.Sprintf("echo '  %s len='${#%s}\n", k, k))
-			}
+			// Base64 encode to avoid ALL shell escaping issues
+			encoded := base64.StdEncoding.EncodeToString([]byte(resolved))
+			b.WriteString(fmt.Sprintf("export %s=\"$(echo %s | base64 -d)\"\n", k, encoded))
+			if strings.HasPrefix(v, "${{") { log.Printf("[k8s] step-env %s -> %s", k, resolved) }
 		}
 		swd := s.WorkingDirectory; if swd == "" { swd = dwd }
 		tgt := wsPath; if swd != "" { tgt = wsPath + "/" + swd }
