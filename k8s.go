@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"net/url"
@@ -313,9 +312,8 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 		b.WriteString(fmt.Sprintf("echo '::group::Step %d: %s'\n", i+1, nm))
 		for k, v := range s.Env {
 			resolved := resolveTemplates(v, task, secrets)
-			// Base64 encode to avoid ALL shell escaping issues
-			encoded := base64.StdEncoding.EncodeToString([]byte(resolved))
-			b.WriteString(fmt.Sprintf("export %s=\"$(echo %s | base64 -d)\"\n", k, encoded))
+			// Simple export with single quotes (values are validated to have no quotes)
+			b.WriteString(fmt.Sprintf("export %s='%s'\n", k, strings.ReplaceAll(resolved, "'", "'\\''")))
 			if strings.HasPrefix(v, "${{") { log.Printf("[k8s] step-env %s -> %s", k, resolved) }
 		}
 		swd := s.WorkingDirectory; if swd == "" { swd = dwd }
