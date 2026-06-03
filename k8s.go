@@ -89,15 +89,16 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 
 	name := fmt.Sprintf("forgejo-task-%d", tid)
 	root := int64(0)
+	dockerGid := int64(999)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: k8sNS},
 		Spec: corev1.PodSpec{
 			RestartPolicy:   corev1.RestartPolicyNever,
-			SecurityContext: &corev1.PodSecurityContext{RunAsUser: &root},
+			SecurityContext: &corev1.PodSecurityContext{RunAsUser: &root, RunAsGroup: &dockerGid, SupplementalGroups: []int64{999}},
 			Containers: []corev1.Container{{
 				Name:            "runner",
 				Image:           image,
-				SecurityContext: &corev1.SecurityContext{RunAsUser: &root},
+				SecurityContext: &corev1.SecurityContext{RunAsUser: &root, RunAsGroup: &dockerGid},
 				Command:         []string{"/bin/bash", "-c", script},
 				Env: []corev1.EnvVar{
 					{Name: "PATH", Value: "/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.bun/bin"},
