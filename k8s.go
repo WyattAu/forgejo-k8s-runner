@@ -70,6 +70,7 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 
 	job, err := parseJob(task.WorkflowPayload)
 	if err != nil { log.Printf("[k8s] Parse: %v", err); return }
+	log.Printf("[k8s] %s secrets=%d", job.Name, len(secrets))
 
 	token := task.Context.Fields["token"].GetStringValue()
 	serverURL := k8sCli.Address()
@@ -301,14 +302,26 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 	b.WriteString(fmt.Sprintf("mkdir -p %s && git clone --depth 1 %s %s 2>&1\n", wsPath, repoURL, wsPath))
 	b.WriteString("echo '::endgroup::'\n")
 	for k, v := range job.Env {
-		b.WriteString(fmt.Sprintf("export %s=%s\n", k, resolveTemplates(v, task, secrets)))
+		resolved := resolveTemplates(v, task, secrets)
+		b.WriteString(fmt.Sprintf("export %s='%s'\n", k, strings.ReplaceAll(resolved, "'", "'\\''")))
+		if strings.HasPrefix(v, "${{") { log.Printf("[k8s] env %s: %s -> %s", k, v, resolved) }
 	}
 	dwd := job.Defaults.Run.WorkingDirectory
 	for i, s := range job.Steps {
 		nm := s.Name; if nm == "" { nm = s.Uses }
 		b.WriteString(fmt.Sprintf("echo '::group::Step %d: %s'\n", i+1, nm))
 		for k, v := range s.Env {
-			b.WriteString(fmt.Sprintf("export %s=%s\n", k, resolveTemplates(v, task, secrets)))
+			resolved := resolveTemplates(v, task, secrets)
+			// Use heredoc to safely pass any value (avoids shell escaping pitfalls)
+			b.WriteString(fmt.Sprintf("export %s=\"$(cat <<'ENVEOF'\n%s\nENVEOF\n)\"\n", k, resolved))
+			if strings.HasPrefix(v, "${{") { log.Printf("[k8s] step-env %s: -> %s", k, resolved) }
+		}
+		// Debug: verify env vars are set and have content
+		if len(s.Env) > 0 {
+			b.WriteString("echo '[DEBUG-ENV]'\n")
+			for k := range s.Env {
+				b.WriteString(fmt.Sprintf("echo '  %s len='${#%s}\n", k, k))
+			}
 		}
 		swd := s.WorkingDirectory; if swd == "" { swd = dwd }
 		tgt := wsPath; if swd != "" { tgt = wsPath + "/" + swd }
