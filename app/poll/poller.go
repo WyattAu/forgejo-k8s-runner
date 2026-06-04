@@ -17,13 +17,15 @@ import (
 type TaskHandler func(context.Context, *runnerv1.Task)
 
 type Poller struct {
-	client     client.Client
-	cfg        *config.Config
-	taskHandler TaskHandler
+	client       client.Client
+	cfg          *config.Config
+	taskHandler  TaskHandler
 	tasksVersion atomic.Int64
-	pollingCtx context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	processed    atomic.Int64 // count of tasks processed
+	emptyFetches atomic.Int64 // consecutive empty fetches
+	pollingCtx   context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 func New(cfg *config.Config, cli client.Client, capacity int) *Poller {
@@ -71,6 +73,7 @@ func (p *Poller) Shutdown(ctx context.Context) error {
 func (p *Poller) fetchTask(ctx context.Context) (*runnerv1.Task, bool) {
 	reqCtx, cancel := context.WithTimeout(ctx, p.cfg.Runner.FetchTimeout)
 	defer cancel()
+
 	v := p.tasksVersion.Load()
 	resp, err := p.client.FetchTask(reqCtx, connect.NewRequest(&runnerv1.FetchTaskRequest{TasksVersion: v}))
 	if err != nil {
@@ -78,8 +81,27 @@ func (p *Poller) fetchTask(ctx context.Context) (*runnerv1.Task, bool) {
 		return nil, false
 	}
 	task := resp.Msg.GetTask()
-	if task != nil { p.tasksVersion.Store(task.Id) }
-	return task, task != nil
+	if task == nil {
+		// No task returned. If we've processed tasks, check for stuck ones
+		// by resetting version to 0 on every N empty fetches to catch
+		// tasks with IDs lower than our current version (Forgejo doesn't
+		// guarantee monotonically increasing task IDs for parallel jobs)
+		if p.processed.Load() > 0 && p.emptyFetches.Add(1) > 2 {
+			p.tasksVersion.Store(0)
+			p.emptyFetches.Store(0)
+			log.Infof("reset tasksVersion to 0 to scan for skipped tasks")
+		}
+		return nil, true
+	}
+
+	// If Forgejo returned a task with ID lower than our version, we're
+	// catching up on skipped tasks — don't regress the version
+	if task.Id >= v {
+		p.tasksVersion.Store(task.Id)
+	}
+	p.emptyFetches.Store(0)
+	p.processed.Add(1)
+	return task, true
 }
 
 func (p *Poller) PollOnce() {

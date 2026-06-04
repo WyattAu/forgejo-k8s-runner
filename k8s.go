@@ -54,7 +54,10 @@ type step struct {
 	Shell            string                 `yaml:"shell"`
 	With             map[string]interface{} `yaml:"with"`
 }
-type workflowDoc struct{ Jobs map[string]workflowJob `yaml:"jobs"` }
+type workflowDoc struct {
+	Env  map[string]string      `yaml:"env"`
+	Jobs map[string]workflowJob `yaml:"jobs"`
+}
 
 var templateRe = regexp.MustCompile(`\$\{\{\s*([^}]+)\s*\}\}`)
 var stepGroupRe = regexp.MustCompile(`::group::Step (\d+):`)
@@ -63,6 +66,11 @@ var errorRe = regexp.MustCompile(`::error::(Step failed|.+)?`)
 func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	tid := task.Id
 	repo := task.Context.Fields["repository"].GetStringValue()
+
+	// Debug: print all context fields
+	for k, v := range task.Context.Fields {
+		log.Printf("[k8s] context[%s] = %s", k, v.GetStringValue())
+	}
 
 	// Get secrets from task.Secrets
 	secrets := make(map[string]string)
@@ -150,7 +158,33 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 		log.Printf("[k8s] UpdateTask(start) error: %v", err)
 	}
 
+	// Send periodic heartbeats while the pod is running. Forgejo's clear_tasks.go
+	// background job marks tasks as "stopped" if it doesn't hear from the runner.
+	// Without heartbeats, the task status gets stuck at "running" (2) instead of
+	// transitioning to "success" (1) when the runner calls UpdateTask(final).
+	heartbeatDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
+					State: &runnerv1.TaskState{
+						Id:        tid,
+						StartedAt: timestamppb.New(startTime),
+					},
+				}))
+			case <-heartbeatDone:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	ok := waitForPod(ctx, name)
+	close(heartbeatDone)
 	logs := getPodLogs(ctx, name)
 	log.Printf("[k8s] %s ok=%v log=%d", job.Name, ok, len(logs))
 
@@ -273,25 +307,43 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 		if sr == runnerv1.Result_RESULT_FAILURE { overallResult = runnerv1.Result_RESULT_FAILURE }
 	}
 
-	k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
-		State: &runnerv1.TaskState{
-			Id: tid, Result: overallResult,
-			StartedAt: timestamppb.New(startTime),
-			StoppedAt: timestamppb.New(now),
-			Steps: steps,
-		},
-	}))
-	if err != nil {
-		log.Printf("[k8s] UpdateTask(final) error: %v", err)
-	} else {
-		log.Printf("[k8s] %s result=%v steps=%d", job.Name, overallResult, len(steps))
+	// Final UpdateTask with retries — Forgejo's clear_tasks.go background job can
+	// race with our UpdateTask, causing the call to succeed (200 OK) but the job
+	// status to remain stuck at "running" (2). Retrying with backoff gives
+	// Forgejo time to finish its cleanup and process our status update.
+	finalState := &runnerv1.TaskState{
+		Id: tid, Result: overallResult,
+		StartedAt: timestamppb.New(startTime),
+		StoppedAt: timestamppb.New(now),
+		Steps: steps,
 	}
+	for attempt := 0; attempt < 3; attempt++ {
+		_, updateErr := k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
+			State: finalState,
+		}))
+		if updateErr == nil {
+			log.Printf("[k8s] %s result=%v steps=%d (attempt %d)", job.Name, overallResult, len(steps), attempt+1)
+			return
+		}
+		log.Printf("[k8s] UpdateTask(final) attempt %d error: %v", attempt+1, updateErr)
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 3 * time.Second)
+		}
+	}
+	log.Printf("[k8s] %s result=%v steps=%d (UpdateTask failed after 3 attempts)", job.Name, overallResult, len(steps))
 }
 
 func parseJob(payload []byte) (*workflowJob, error) {
 	var doc workflowDoc
 	if err := yaml.Unmarshal(payload, &doc); err != nil { return nil, err }
-	for _, j := range doc.Jobs { return &j, nil }
+	for _, j := range doc.Jobs {
+		// Merge workflow-level env into job-level env (job overrides workflow)
+		if j.Env == nil { j.Env = make(map[string]string) }
+		for k, v := range doc.Env {
+			if _, exists := j.Env[k]; !exists { j.Env[k] = v }
+		}
+		return &j, nil
+	}
 	return nil, fmt.Errorf("no jobs")
 }
 
