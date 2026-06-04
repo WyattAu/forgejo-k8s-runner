@@ -426,7 +426,12 @@ func waitForPod(ctx context.Context, name string) bool {
 	for i := 0; i < 720; i++ {
 		time.Sleep(5 * time.Second)
 		p, e := k8sClient.CoreV1().Pods(k8sNS).Get(ctx, name, metav1.GetOptions{})
-		if e != nil { continue }
+		if e != nil {
+			// Pod was deleted externally (force-delete, eviction, etc).
+			// Don't spin for up to 1 hour waiting for it to come back.
+			log.Printf("[k8s] waitForPod: pod %s gone: %v", name, e)
+			return false
+		}
 		if p.Status.Phase == corev1.PodSucceeded { return true }
 		if p.Status.Phase == corev1.PodFailed { return false }
 	}
