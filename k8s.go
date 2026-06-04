@@ -67,10 +67,23 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	tid := task.Id
 	repo := task.Context.Fields["repository"].GetStringValue()
 
-	// Debug: print all context fields
-	for k, v := range task.Context.Fields {
-		log.Printf("[k8s] context[%s] = %s", k, v.GetStringValue())
-	}
+	// Task context with generous timeout for the full job execution.
+	// Separate from ctx (polling context) so that SIGTERM doesn't kill
+	// in-flight UpdateTask RPCs mid-execution.
+	const taskTimeout = 2 * time.Hour
+	taskCtx, taskCancel := context.WithTimeout(context.Background(), taskTimeout)
+	defer taskCancel()
+
+	// If the parent context is cancelled (SIGTERM), give the task 30s
+	// to finish its current operation and send the final UpdateTask.
+	go func() {
+		select {
+		case <-ctx.Done():
+			log.Printf("[k8s] task %d: SIGTERM received, giving 30s grace", tid)
+			time.AfterFunc(30*time.Second, taskCancel)
+		case <-taskCtx.Done():
+		}
+	}()
 
 	// Get secrets from task.Secrets
 	secrets := make(map[string]string)
@@ -149,7 +162,7 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	for i := range job.Steps {
 		initSteps[i] = &runnerv1.StepState{Id: int64(i)}
 	}
-	if _, err := k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
+	if _, err := k8sCli.UpdateTask(taskCtx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
 		State: &runnerv1.TaskState{
 			Id: tid, StartedAt: timestamppb.New(startTime),
 			Steps: initSteps,
@@ -183,9 +196,9 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 		}
 	}()
 
-	ok := waitForPod(ctx, name)
+	ok := waitForPod(taskCtx, name)
 	close(heartbeatDone)
-	logs := getPodLogs(ctx, name)
+	logs := getPodLogs(taskCtx, name)
 	log.Printf("[k8s] %s ok=%v log=%d", job.Name, ok, len(logs))
 
 	// Build secret replacer for masking
@@ -221,7 +234,7 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 				Content: content,
 			})
 		}
-		k8sCli.UpdateLog(ctx, connectcgo.NewRequest(&runnerv1.UpdateLogRequest{
+		k8sCli.UpdateLog(taskCtx, connectcgo.NewRequest(&runnerv1.UpdateLogRequest{
 			TaskId: tid, Index: int64(i),
 			Rows:   rows, NoMore: end == len(lines),
 		}))
@@ -318,7 +331,7 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 		Steps: steps,
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		_, updateErr := k8sCli.UpdateTask(ctx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
+		_, updateErr := k8sCli.UpdateTask(taskCtx, connectcgo.NewRequest(&runnerv1.UpdateTaskRequest{
 			State: finalState,
 		}))
 		if updateErr == nil {
