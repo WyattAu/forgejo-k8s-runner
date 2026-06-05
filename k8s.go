@@ -108,6 +108,29 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 
 	image := job.Container.Image
 	if image == "" { image = "ghcr.io/wyattau/forgejo-runner-nix:latest" }
+	// Resolve templates in container image (e.g. ${{ env.RUNNER_IMAGE }})
+	image = resolveTemplates(image, task, secrets, job.Env)
+
+	// Build GitHub-like env vars from task context so workflow scripts
+	// can use $GITHUB_EVENT_NAME, $GITHUB_REF etc. in bash guards.
+	githubEnv := []corev1.EnvVar{
+		{Name: "CI", Value: "true"},
+		{Name: "GITHUB_ACTIONS", Value: "true"},
+	}
+	for _, key := range []string{
+		"event_name", "ref", "sha", "head_ref", "base_ref",
+		"repository", "repository_owner", "actor",
+		"workflow", "run_id", "run_number", "run_attempt",
+	} {
+		fieldKey := "github." + key
+		envKey := "GITHUB_" + strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
+		if v := task.Context.Fields[fieldKey]; v != nil {
+			val := v.GetStringValue()
+			if val != "" {
+				githubEnv = append(githubEnv, corev1.EnvVar{Name: envKey, Value: val})
+			}
+		}
+	}
 
 	name := fmt.Sprintf("forgejo-task-%d", tid)
 	root := int64(0)
@@ -122,14 +145,14 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 				Image:           image,
 				SecurityContext: &corev1.SecurityContext{RunAsUser: &root, RunAsGroup: &dockerGid},
 				Command:         []string{"/bin/bash", "-c", script},
-				Env: []corev1.EnvVar{
+				Env: append([]corev1.EnvVar{
 					{Name: "PATH", Value: "/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.bun/bin"},
 					{Name: "HOME", Value: "/root"},
 					{Name: "GIT_TERMINAL_PROMPT", Value: "0"},
 					{Name: "GITHUB_PATH", Value: "/dev/null"},
 					{Name: "GITHUB_ENV", Value: "/dev/null"},
 					{Name: "GITHUB_OUTPUT", Value: "/dev/null"},
-				},
+				}, githubEnv...),
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "ws", MountPath: "/workspace"},
 					{Name: "nix", MountPath: "/nix"},
@@ -393,6 +416,8 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 				b.WriteString("echo checkout:done\n")
 			} else if strings.Contains(s.Uses, "setup-bun") || strings.Contains(s.Uses, "oven-sh") {
 				b.WriteString("echo 'Installing bun...'\n")
+				// bun's install script needs unzip; ensure it's available.
+				b.WriteString("(command -v unzip >/dev/null 2>&1 || apk add --no-cache unzip 2>/dev/null || apt-get install -y -qq unzip 2>/dev/null || yum install -y -q unzip 2>/dev/null) 2>&1\n")
 				b.WriteString("curl -fsSL https://bun.sh/install | bash 2>&1\n")
 				b.WriteString("export BUN_INSTALL=\"$HOME/.bun\"\n")
 				b.WriteString("export PATH=\"$HOME/.bun/bin:$PATH\"\n")
@@ -451,8 +476,12 @@ func waitForPod(ctx context.Context, name string) bool {
 	return false
 }
 func getPodLogs(ctx context.Context, name string) string {
+	// Use a fresh context with timeout so log collection doesn't hang
+	// if the K3s API is slow (intermittent TLS handshake timeouts).
+	logCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	req := k8sClient.CoreV1().Pods(k8sNS).GetLogs(name, &corev1.PodLogOptions{})
-	s, e := req.Stream(ctx)
+	s, e := req.Stream(logCtx)
 	if e != nil { return fmt.Sprintf("ERR:%v", e) }
 	defer s.Close()
 	buf := new(bytes.Buffer); buf.ReadFrom(s)
