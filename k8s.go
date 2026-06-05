@@ -71,7 +71,7 @@ type workflowDoc struct {
 
 var templateRe = regexp.MustCompile(`\$\{\{\s*([^}]+)\s*\}\}`)
 var stepGroupRe = regexp.MustCompile(`::group::Step (\d+):`)
-var errorRe = regexp.MustCompile(`::error::(Step failed|.+)?`)
+var errorRe = regexp.MustCompile(`::error::Step failed`)
 
 func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	tid := task.Id
@@ -106,7 +106,7 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 
 	job, err := parseJob(task.WorkflowPayload, jobName)
 	if err != nil { log.Printf("[k8s] Parse: %v", err); return }
-	log.Printf("[k8s] %s job=%q secrets=%d", job.Name, jobName, len(secrets))
+	log.Printf("[k8s] %s job=%q secrets=%d services=%d", job.Name, jobName, len(secrets), len(job.Services))
 
 	token := task.Context.Fields["token"].GetStringValue()
 	serverURL := k8sCli.Address()
@@ -176,32 +176,37 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 				Protocol:      corev1.ProtocolTCP,
 			})
 		}
-		sidecars = append(sidecars, corev1.Container{
+		// Default ports for well-known services when ports: is not specified
+		if len(sidecarPorts) == 0 {
+			defaultPorts := map[string]int32{"postgres": 5432, "redis": 6379}
+			if dp, ok := defaultPorts[svcName]; ok {
+				sidecarPorts = append(sidecarPorts, corev1.ContainerPort{
+					ContainerPort: dp,
+					Protocol:      corev1.ProtocolTCP,
+				})
+			}
+		}
+		sc := corev1.Container{
 			Name:    svcName,
 			Image:   svc.Image,
 			Env:     sidecarEnv,
 			Ports:   sidecarPorts,
-			ReadinessProbe: &corev1.Probe{
+			SecurityContext: &corev1.SecurityContext{RunAsUser: &root},
+		}
+		// Only add readiness probe when we have a valid port
+		if len(sidecarPorts) > 0 {
+			sc.ReadinessProbe = &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{
 					TCPSocket: &corev1.TCPSocketAction{
-						Port: func() intstr.IntOrString {
-							if len(svc.Ports) > 0 {
-								parts := strings.SplitN(svc.Ports[0], ":", 2)
-								port := parts[len(parts)-1]
-								var p int32
-								fmt.Sscanf(port, "%d", &p)
-								return intstr.FromInt32(p)
-							}
-							return intstr.FromInt32(0)
-						}(),
+						Port: intstr.FromInt32(sidecarPorts[0].ContainerPort),
 					},
 				},
 				InitialDelaySeconds: 5,
 				PeriodSeconds:       2,
 				FailureThreshold:    30,
-			},
-			SecurityContext: &corev1.SecurityContext{RunAsUser: &root},
-		})
+			}
+		}
+		sidecars = append(sidecars, sc)
 		hostAliases = append(hostAliases, corev1.HostAlias{
 			IP: "127.0.0.1",
 			Hostnames: []string{svcName},
@@ -488,9 +493,19 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 	// Services run as sidecar containers in the same pod, reachable
 	// via 127.0.0.1 (hostAliases map service name → loopback).
 	for svcName, svc := range job.Services {
-		if len(svc.Ports) == 0 { continue }
-		parts := strings.SplitN(svc.Ports[0], ":", 2)
-		port := parts[len(parts)-1]
+		// Determine port: use explicit ports or well-known defaults
+		var port string
+		if len(svc.Ports) > 0 {
+			parts := strings.SplitN(svc.Ports[0], ":", 2)
+			port = parts[len(parts)-1]
+		} else {
+			defaultPorts := map[string]string{"postgres": "5432", "redis": "6379"}
+			if dp, ok := defaultPorts[svcName]; ok {
+				port = dp
+			} else {
+				continue // no port to wait on
+			}
+		}
 		b.WriteString(fmt.Sprintf("echo '::group::Wait for %s'\n", svcName))
 		b.WriteString("for i in $(seq 1 60); do\n")
 		b.WriteString(fmt.Sprintf("  if (echo > /dev/tcp/127.0.0.1/%s) 2>/dev/null; then\n", port))
@@ -583,15 +598,29 @@ func resolveTemplates(s string, task *runnerv1.Task, secrets map[string]string, 
 }
 
 func waitForPod(ctx context.Context, name string) bool {
+	consecutiveErrors := 0
 	for i := 0; i < 720; i++ {
 		time.Sleep(5 * time.Second)
 		p, e := k8sClient.CoreV1().Pods(k8sNS).Get(ctx, name, metav1.GetOptions{})
 		if e != nil {
-			// Pod was deleted externally (force-delete, eviction, etc).
-			// Don't spin for up to 1 hour waiting for it to come back.
-			log.Printf("[k8s] waitForPod: pod %s gone: %v", name, e)
-			return false
+			consecutiveErrors++
+			// Only treat as "pod gone" if the error is a 404 (not found).
+			// Transient errors (TLS timeout, HTTP2 connection lost, network blip)
+			// should be retried — the pod may still be running fine.
+			if strings.Contains(e.Error(), "not found") || strings.Contains(e.Error(), "404") {
+				log.Printf("[k8s] waitForPod: pod %s deleted (404): %v", name, e)
+				return false
+			}
+			if consecutiveErrors <= 3 {
+				log.Printf("[k8s] waitForPod: pod %s API error (retry %d): %v", name, consecutiveErrors, e)
+				continue
+			}
+			// After 3+ consecutive transient errors, the API may be down.
+			// Keep trying but log at warn level — don't kill the task yet.
+			log.Printf("[k8s] waitForPod: pod %s API still failing (%d consecutive): %v", name, consecutiveErrors, e)
+			continue
 		}
+		consecutiveErrors = 0
 		if p.Status.Phase == corev1.PodSucceeded { return true }
 		if p.Status.Phase == corev1.PodFailed { return false }
 	}
