@@ -224,6 +224,11 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 
 	ok := waitForPod(taskCtx, name)
 	close(heartbeatDone)
+
+	// Give containerd a moment to flush logs to disk after pod completion.
+	// Without this, filesystem log reads may be truncated.
+	time.Sleep(3 * time.Second)
+
 	logs := getPodLogs(taskCtx, name)
 	log.Printf("[k8s] %s ok=%v log=%d", job.Name, ok, len(logs))
 
