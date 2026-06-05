@@ -477,14 +477,27 @@ func waitForPod(ctx context.Context, name string) bool {
 	return false
 }
 func getPodLogs(ctx context.Context, name string) string {
-	// Use a fresh context with timeout so log collection doesn't hang
-	// if the K3s API is slow (intermittent TLS handshake timeouts).
-	logCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req := k8sClient.CoreV1().Pods(k8sNS).GetLogs(name, &corev1.PodLogOptions{})
-	s, e := req.Stream(logCtx)
-	if e != nil { return fmt.Sprintf("ERR:%v", e) }
-	defer s.Close()
-	buf := new(bytes.Buffer); buf.ReadFrom(s)
-	return buf.String()
+	// Use a fresh context with timeout and retries so log collection
+	// doesn't hang if the K3s API has intermittent TLS handshake timeouts.
+	for attempt := 0; attempt < 3; attempt++ {
+		logCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		req := k8sClient.CoreV1().Pods(k8sNS).GetLogs(name, &corev1.PodLogOptions{})
+		s, e := req.Stream(logCtx)
+		if e != nil {
+			log.Printf("[k8s] getPodLogs attempt %d error: %v", attempt+1, e)
+			cancel()
+			time.Sleep(time.Duration(attempt+1) * 5 * time.Second)
+			continue
+		}
+		defer s.Close()
+		defer cancel()
+		buf := new(bytes.Buffer); buf.ReadFrom(s)
+		result := buf.String()
+		if len(result) > 0 {
+			return result
+		}
+		log.Printf("[k8s] getPodLogs attempt %d: empty logs, retrying", attempt+1)
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Second)
+	}
+	return "ERR:log collection failed after 3 attempts"
 }
