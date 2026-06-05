@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -37,12 +38,18 @@ func initK8s(kc string) error {
 }
 func setK8sContext(cli *client.HTTPClient, ns string) { k8sCli = cli; k8sNS = ns }
 
+type serviceContainer struct {
+	Image string            `yaml:"image"`
+	Env   map[string]string `yaml:"env"`
+	Ports []string          `yaml:"ports"`
+}
 type workflowJob struct {
-	Name    string
-	RunsOn  string            `yaml:"runs-on"`
-	Timeout interface{}       `yaml:"timeout-minutes"`
-	Steps   []step            `yaml:"steps"`
-	Env     map[string]string `yaml:"env"`
+	Name     string
+	RunsOn   string                      `yaml:"runs-on"`
+	Timeout  interface{}                 `yaml:"timeout-minutes"`
+	Steps    []step                      `yaml:"steps"`
+	Env      map[string]string           `yaml:"env"`
+	Services map[string]serviceContainer `yaml:"services"`
 	Defaults struct {
 		Run struct{ WorkingDirectory string `yaml:"working-directory"` } `yaml:"run"`
 	} `yaml:"defaults"`
@@ -92,9 +99,14 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	secrets := make(map[string]string)
 	for k, v := range task.Secrets { secrets[k] = v }
 
-	job, err := parseJob(task.WorkflowPayload)
+	jobName := ""
+	if v := task.Context.Fields["github.job"]; v != nil {
+		jobName = v.GetStringValue()
+	}
+
+	job, err := parseJob(task.WorkflowPayload, jobName)
 	if err != nil { log.Printf("[k8s] Parse: %v", err); return }
-	log.Printf("[k8s] %s secrets=%d", job.Name, len(secrets))
+	log.Printf("[k8s] %s job=%q secrets=%d", job.Name, jobName, len(secrets))
 
 	token := task.Context.Fields["token"].GetStringValue()
 	serverURL := k8sCli.Address()
@@ -138,12 +150,72 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	name := fmt.Sprintf("forgejo-task-%d", tid)
 	root := int64(0)
 	dockerGid := int64(999)
+
+	// Build sidecar containers and host aliases for service containers.
+	// In GitHub Actions, `services:` creates containers accessible by name.
+	// In K8s pods, containers share the network namespace — services are
+	// reachable via 127.0.0.1. We add hostAliases so the service name
+	// resolves to loopback, preserving workflow env vars like
+	// DATABASE_URL=postgres://...@postgres:5432/...
+	var sidecars []corev1.Container
+	var hostAliases []corev1.HostAlias
+	for svcName, svc := range job.Services {
+		sidecarEnv := make([]corev1.EnvVar, 0, len(svc.Env))
+		for k, v := range svc.Env {
+			sidecarEnv = append(sidecarEnv, corev1.EnvVar{Name: k, Value: v})
+		}
+		sidecarPorts := make([]corev1.ContainerPort, 0, len(svc.Ports))
+		for _, p := range svc.Ports {
+			// Parse "host:container" or bare port
+			parts := strings.SplitN(p, ":", 2)
+			containerPort := parts[len(parts)-1]
+			var portVal int32
+			fmt.Sscanf(containerPort, "%d", &portVal)
+			sidecarPorts = append(sidecarPorts, corev1.ContainerPort{
+				ContainerPort: portVal,
+				Protocol:      corev1.ProtocolTCP,
+			})
+		}
+		sidecars = append(sidecars, corev1.Container{
+			Name:    svcName,
+			Image:   svc.Image,
+			Env:     sidecarEnv,
+			Ports:   sidecarPorts,
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: func() intstr.IntOrString {
+							if len(svc.Ports) > 0 {
+								parts := strings.SplitN(svc.Ports[0], ":", 2)
+								port := parts[len(parts)-1]
+								var p int32
+								fmt.Sscanf(port, "%d", &p)
+								return intstr.FromInt32(p)
+							}
+							return intstr.FromInt32(0)
+						}(),
+					},
+				},
+				InitialDelaySeconds: 5,
+				PeriodSeconds:       2,
+				FailureThreshold:    30,
+			},
+			SecurityContext: &corev1.SecurityContext{RunAsUser: &root},
+		})
+		hostAliases = append(hostAliases, corev1.HostAlias{
+			IP: "127.0.0.1",
+			Hostnames: []string{svcName},
+		})
+		log.Printf("[k8s] service %s: image=%s ports=%v", svcName, svc.Image, svc.Ports)
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: k8sNS},
 		Spec: corev1.PodSpec{
 			RestartPolicy:   corev1.RestartPolicyNever,
+			HostAliases:     hostAliases,
 			SecurityContext: &corev1.PodSecurityContext{RunAsUser: &root, RunAsGroup: &dockerGid, SupplementalGroups: []int64{999}},
-			Containers: []corev1.Container{{
+			Containers: append([]corev1.Container{{
 				Name:            "runner",
 				Image:           image,
 				SecurityContext: &corev1.SecurityContext{RunAsUser: &root, RunAsGroup: &dockerGid},
@@ -162,7 +234,7 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 					{Name: "docker", MountPath: "/var/run/docker.sock"},
 					{Name: "dockercfg", MountPath: "/root/.docker"},
 				},
-			}},
+			}}, sidecars...),
 			Volumes: []corev1.Volume{
 				{Name: "ws", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 				{Name: "nix", VolumeSource: corev1.VolumeSource{
@@ -377,23 +449,64 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	log.Printf("[k8s] %s result=%v steps=%d (UpdateTask failed after 3 attempts)", job.Name, overallResult, len(steps))
 }
 
-func parseJob(payload []byte) (*workflowJob, error) {
+func parseJob(payload []byte, jobName string) (*workflowJob, error) {
 	var doc workflowDoc
 	if err := yaml.Unmarshal(payload, &doc); err != nil { return nil, err }
-	for _, j := range doc.Jobs {
-		// Merge workflow-level env into job-level env (job overrides workflow)
-		if j.Env == nil { j.Env = make(map[string]string) }
-		for k, v := range doc.Env {
-			if _, exists := j.Env[k]; !exists { j.Env[k] = v }
+
+	// Try to find the specific job by name first (from github.job context).
+	// Without this, Go map iteration is non-deterministic and every task
+	// would run a random job from the workflow.
+	if jobName != "" {
+		if j, ok := doc.Jobs[jobName]; ok {
+			mergeWorkflowEnv(&j, &doc)
+			return &j, nil
 		}
+		log.Printf("[k8s] job %q not found in workflow, falling back to first job", jobName)
+	}
+
+	// Fallback: return the first job (for backward compatibility).
+	for _, j := range doc.Jobs {
+		mergeWorkflowEnv(&j, &doc)
 		return &j, nil
 	}
 	return nil, fmt.Errorf("no jobs")
 }
 
+// mergeWorkflowEnv merges workflow-level env into job-level env (job overrides workflow).
+func mergeWorkflowEnv(j *workflowJob, doc *workflowDoc) {
+	if j.Env == nil { j.Env = make(map[string]string) }
+	for k, v := range doc.Env {
+		if _, exists := j.Env[k]; !exists { j.Env[k] = v }
+	}
+}
+
 func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Task, secrets map[string]string) string {
 	var b strings.Builder
 	b.WriteString("set +e\n")  // per-step: steps handle their own errors
+
+	// Wait for service containers to be ready before cloning.
+	// Services run as sidecar containers in the same pod, reachable
+	// via 127.0.0.1 (hostAliases map service name → loopback).
+	for svcName, svc := range job.Services {
+		if len(svc.Ports) == 0 { continue }
+		parts := strings.SplitN(svc.Ports[0], ":", 2)
+		port := parts[len(parts)-1]
+		b.WriteString(fmt.Sprintf("echo '::group::Wait for %s'\n", svcName))
+		b.WriteString("for i in $(seq 1 60); do\n")
+		b.WriteString(fmt.Sprintf("  if (echo > /dev/tcp/127.0.0.1/%s) 2>/dev/null; then\n", port))
+		b.WriteString(fmt.Sprintf("    echo '%s is ready'\n", svcName))
+		b.WriteString("    break\n")
+		b.WriteString("  fi\n")
+		b.WriteString(fmt.Sprintf("  echo 'Waiting for %s... '\n", svcName))
+		b.WriteString("  echo \"$i/60\"\n")
+		b.WriteString("  sleep 2\n")
+		b.WriteString("done\n")
+		b.WriteString(fmt.Sprintf("if ! (echo > /dev/tcp/127.0.0.1/%s) 2>/dev/null; then\n", port))
+		b.WriteString(fmt.Sprintf("  echo '::error::%s failed to start within 120 seconds'\n", svcName))
+		b.WriteString("fi\n")
+		b.WriteString("echo '::endgroup::'\n")
+	}
+
 	b.WriteString("echo '::group::Clone repo'\n")
 	b.WriteString(fmt.Sprintf("mkdir -p %s && git clone --depth 1 %s %s 2>&1\n", wsPath, repoURL, wsPath))
 	b.WriteString("echo '::endgroup::'\n")
