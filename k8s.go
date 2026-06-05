@@ -73,6 +73,24 @@ var templateRe = regexp.MustCompile(`\$\{\{\s*([^}]+)\s*\}\}`)
 var stepGroupRe = regexp.MustCompile(`::group::Step (\d+):`)
 var errorRe = regexp.MustCompile(`::error::Step failed`)
 
+// cleanupOrphanedPods deletes completed/failed pods left over from previous
+// runner crashes or restarts. Called once at startup.
+func cleanupOrphanedPods(namespace string) {
+	pods, err := k8sClient.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app.kubernetes.io/managed-by=forgejo-k8s-runner",
+	})
+	if err != nil {
+		log.Printf("[k8s] cleanup: list pods failed: %v", err)
+		return
+	}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			log.Printf("[k8s] cleanup: deleting orphaned pod %s (phase=%s)", pod.Name, pod.Status.Phase)
+			k8sClient.CoreV1().Pods(namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+		}
+	}
+}
+
 func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	tid := task.Id
 	repo := task.Context.Fields["repository"].GetStringValue()
@@ -215,7 +233,14 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 	}
 
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: k8sNS},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: k8sNS,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "forgejo-k8s-runner",
+				"forgejo-task-id":              fmt.Sprintf("%d", tid),
+			},
+		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:   corev1.RestartPolicyNever,
 			HostAliases:     hostAliases,

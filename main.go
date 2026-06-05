@@ -33,6 +33,9 @@ func main() {
 
 	if err := initK8s(cfg.K8s.Kubeconfig); err != nil { log.Fatalf("k8s: %v", err) }
 
+	// Clean up orphaned pods from previous runs (crash/restart)
+	cleanupOrphanedPods(cfg.K8s.Namespace)
+
 	cli := client.New(reg.Address, cfg.Runner.Insecure, reg.UUID, reg.Token, ver.Version())
 	setK8sContext(cli, cfg.K8s.Namespace)
 
