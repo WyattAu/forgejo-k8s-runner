@@ -417,7 +417,8 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 			} else if strings.Contains(s.Uses, "setup-bun") || strings.Contains(s.Uses, "oven-sh") {
 				b.WriteString("echo 'Installing bun...'\n")
 				// bun's install script needs unzip; ensure it's available.
-				b.WriteString("(command -v unzip >/dev/null 2>&1 || apk add --no-cache unzip 2>/dev/null || apt-get install -y -qq unzip 2>/dev/null || yum install -y -q unzip 2>/dev/null) 2>&1\n")
+				// Try apt-get first (Debian/Ubuntu, most common), then apk (Wolfi/Alpine), then yum.
+				b.WriteString("(command -v unzip >/dev/null 2>&1 || (DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip 2>/dev/null) || (apk add --no-cache unzip 2>/dev/null) || (yum install -y -q unzip 2>/dev/null)) 2>&1\n")
 				b.WriteString("curl -fsSL https://bun.sh/install | bash 2>&1\n")
 				b.WriteString("export BUN_INSTALL=\"$HOME/.bun\"\n")
 				b.WriteString("export PATH=\"$HOME/.bun/bin:$PATH\"\n")
