@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -476,28 +479,114 @@ func waitForPod(ctx context.Context, name string) bool {
 	}
 	return false
 }
+// containerdLogRe matches the containerd log line prefix:
+// "2026-06-05T14:46:53.249296323+01:00 stdout F <content>"
+// We strip it to return just the content (matching K8s API behavior).
+var containerdLogRe = regexp.MustCompile(`^\S+\s+(?:stdout|stderr)\s+F\s+`)
+
 func getPodLogs(ctx context.Context, name string) string {
-	// Use a fresh context with timeout and retries so log collection
-	// doesn't hang if the K3s API has intermittent TLS handshake timeouts.
+	// STRATEGY 1 (preferred): Read logs directly from the filesystem.
+	// This bypasses the K3s API entirely, avoiding intermittent TLS handshake
+	// timeouts. Containerd stores logs at:
+	//   /var/log/pods/{namespace}_{pod}_{uid}/{container}/0.log
+	//
+	// We glob for the pod directory (UID is unknown) and read the "runner"
+	// container's log file. This is a local disk read — fast and reliable.
+	if result, err := getPodLogsFromFilesystem(name); err == nil && len(result) > 0 {
+		return result
+	} else if err != nil {
+		log.Printf("[k8s] filesystem log read failed for %s: %v", name, err)
+	}
+
+	// STRATEGY 2 (fallback): Read via K3s API with retries.
+	// Used when the pod directory doesn't exist yet (race) or on non-K3s
+	// clusters where /var/log/pods may not be available.
+	log.Printf("[k8s] falling back to K3s API for logs: %s", name)
 	for attempt := 0; attempt < 3; attempt++ {
 		logCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		req := k8sClient.CoreV1().Pods(k8sNS).GetLogs(name, &corev1.PodLogOptions{})
 		s, e := req.Stream(logCtx)
 		if e != nil {
-			log.Printf("[k8s] getPodLogs attempt %d error: %v", attempt+1, e)
+			log.Printf("[k8s] getPodLogs API attempt %d error: %v", attempt+1, e)
 			cancel()
 			time.Sleep(time.Duration(attempt+1) * 5 * time.Second)
 			continue
 		}
-		defer s.Close()
-		defer cancel()
-		buf := new(bytes.Buffer); buf.ReadFrom(s)
+		buf := new(bytes.Buffer)
+		_, readErr := buf.ReadFrom(s)
+		s.Close()
+		cancel()
+		if readErr != nil {
+			log.Printf("[k8s] getPodLogs API attempt %d read error: %v", attempt+1, readErr)
+			time.Sleep(time.Duration(attempt+1) * 5 * time.Second)
+			continue
+		}
 		result := buf.String()
 		if len(result) > 0 {
 			return result
 		}
-		log.Printf("[k8s] getPodLogs attempt %d: empty logs, retrying", attempt+1)
+		log.Printf("[k8s] getPodLogs API attempt %d: empty logs, retrying", attempt+1)
 		time.Sleep(time.Duration(attempt+1) * 5 * time.Second)
 	}
 	return "ERR:log collection failed after 3 attempts"
+}
+
+// getPodLogsFromFilesystem reads containerd log files directly from disk.
+// Returns the log content with containerd prefixes stripped, or an error.
+func getPodLogsFromFilesystem(name string) (string, error) {
+	// Pod directory format: {namespace}_{pod}_{uid}
+	// We know namespace="ci-jobs" and pod=name, but UID is unknown.
+	// Glob: /var/log/pods/ci-jobs_{name}_*/**
+	pattern := filepath.Join("/var/log/pods", fmt.Sprintf("%s_%s_*", k8sNS, name))
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", fmt.Errorf("glob %s: %w", pattern, err)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no pod directory found for %s", name)
+	}
+
+	// Use the first match (there should be exactly one)
+	podDir := matches[0]
+
+	// Look for the "runner" container log file
+	logFile := filepath.Join(podDir, "runner", "0.log")
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		// Try all container directories (in case container is named differently)
+		entries, readErr := os.ReadDir(podDir)
+		if readErr != nil {
+			return "", fmt.Errorf("read pod dir: %w", readErr)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				candidate := filepath.Join(podDir, entry.Name(), "0.log")
+				if _, statErr := os.Stat(candidate); statErr == nil {
+					data, err = os.ReadFile(candidate)
+					if err == nil {
+						break
+					}
+				}
+			}
+		}
+		if data == nil {
+			return "", fmt.Errorf("no log file found in %s", podDir)
+		}
+	}
+
+	// Strip containerd log prefixes from each line
+	var buf strings.Builder
+	scanner := io.NopCloser(bytes.NewReader(data))
+	raw, _ := io.ReadAll(scanner)
+	for _, line := range strings.Split(string(raw), "\n") {
+		if stripped := containerdLogRe.ReplaceAllString(line, ""); stripped != line {
+			buf.WriteString(stripped)
+			buf.WriteByte('\n')
+		} else {
+			// Line without containerd prefix — pass through as-is
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+		}
+	}
+	return buf.String(), nil
 }
