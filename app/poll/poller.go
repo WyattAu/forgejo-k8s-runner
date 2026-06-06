@@ -82,20 +82,11 @@ func (p *Poller) fetchTask(ctx context.Context) (*runnerv1.Task, bool) {
 	}
 	task := resp.Msg.GetTask()
 	if task == nil {
-		// No task returned. If we've processed tasks, check for stuck ones
-		// by resetting version to 0 on every N empty fetches to catch
-		// tasks with IDs lower than our current version (Forgejo doesn't
-		// guarantee monotonically increasing task IDs for parallel jobs)
-		if p.processed.Load() > 0 && p.emptyFetches.Add(1) > 2 {
-			p.tasksVersion.Store(0)
-			p.emptyFetches.Store(0)
-			log.Infof("reset tasksVersion to 0 to scan for skipped tasks")
-		}
 		return nil, true
 	}
 
-	// If Forgejo returned a task with ID lower than our version, we're
-	// catching up on skipped tasks — don't regress the version
+	// Track the highest task ID we've seen. Never regress —
+	// resetting to 0 would re-process stale tasks from abandoned runs.
 	if task.Id >= v {
 		p.tasksVersion.Store(task.Id)
 	}
