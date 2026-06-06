@@ -394,18 +394,35 @@ func k8sTaskHandler(ctx context.Context, task *runnerv1.Task) {
 		}
 	}
 
-	// Detect per-step failure: scan each step's log lines for ::error::
+	// Detect per-step failure: parse ::step-exit::N markers from stderr output.
+	// This replaces the old errorRe-based detection which caused false failures
+	// when Forgejo sent stale YAML without || true.
 	stepResults := make([]runnerv1.Result, len(job.Steps))
 	for i := range stepResults {
 		stepResults[i] = runnerv1.Result_RESULT_SUCCESS
 	}
+	stepExitRe := regexp.MustCompile(`::step-exit::(\d+)`)
 	for i := range job.Steps {
 		end := stepEnds[i]
 		if end > int64(len(lines)) { end = int64(len(lines)) }
-		for j := stepStarts[i]; j < end; j++ {
-			if errorRe.MatchString(lines[j]) {
-				stepResults[i] = runnerv1.Result_RESULT_FAILURE
+		// Scan from the end of the step backwards for the exit code marker
+		for j := end - 1; j >= stepStarts[i]; j-- {
+			if m := stepExitRe.FindStringSubmatch(lines[j]); m != nil {
+				var exitCode int
+				fmt.Sscanf(m[1], "%d", &exitCode)
+				if exitCode != 0 {
+					stepResults[i] = runnerv1.Result_RESULT_FAILURE
+				}
 				break
+			}
+		}
+		// Fallback: also check for ::error::Step failed (backward compat)
+		if stepResults[i] == runnerv1.Result_RESULT_SUCCESS {
+			for j := stepStarts[i]; j < end; j++ {
+				if errorRe.MatchString(lines[j]) {
+					stepResults[i] = runnerv1.Result_RESULT_FAILURE
+					break
+				}
 			}
 		}
 	}
@@ -570,8 +587,11 @@ func generateScript(job *workflowJob, repoURL, wsPath string, task *runnerv1.Tas
 		b.WriteString(fmt.Sprintf("cd %s\n", tgt))
 		if s.Run != "" {
 			sh := s.Shell; if sh == "" { sh = "bash" }
-			// Run with set -e, capture exit code, but don't kill the script
-			b.WriteString("(\nset -e\n" + resolveTemplates(s.Run, task, secrets, job.Env) + "\n) || echo '::error::Step failed'\n")
+			resolved := resolveTemplates(s.Run, task, secrets, job.Env)
+			// Run step in a subshell with set -e. Capture exit code via
+			// a dedicated echo marker BEFORE the || error fallback.
+			// This way the exit code is always captured, even on failure.
+			b.WriteString("(\nset -e\n" + resolved + "\necho \":step-exit:0\"\n) ; echo \":step-exit:$?\"\n")
 		} else if s.Uses != "" {
 			if strings.Contains(s.Uses, "actions/checkout") {
 				b.WriteString("echo checkout:done\n")
